@@ -1,0 +1,8 @@
+pytz
+python-telegram-bot
+yfinance
+pandas
+pandas_ta
+requests
+lxml
+python-dotenv
