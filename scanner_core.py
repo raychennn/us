@@ -5,6 +5,7 @@ import yfinance as yf
 import asyncio
 import traceback
 import io
+import math  # 用於無條件進位計算
 from datetime import datetime, timedelta
 
 # --- A. 自動獲取 NASDAQ 清單 (嚴格過濾版) ---
@@ -76,7 +77,7 @@ def calculate_performance_score(close_series):
     except:
         return -999
 
-# --- C. VCP 策略檢查邏輯 (含 Gap Reset) ---
+# --- C. VCP 策略檢查邏輯 (含 Dynamic Gap Reset & 10天視窗) ---
 def check_vcp_criteria(df, qqq_score=None):
     """
     回傳 True/False
@@ -88,6 +89,7 @@ def check_vcp_criteria(df, qqq_score=None):
     vol = df['Volume']
     high = df['High']
     low = df['Low']
+    open_price = df['Open'] # 需獲取 Open 計算跳空
     
     current_c = close.iloc[-1]
     
@@ -117,26 +119,39 @@ def check_vcp_criteria(df, qqq_score=None):
     avg_vol_3 = vol.tail(3).mean()
     if avg_vol_3 >= (avg_vol_20 * 0.70): return False
 
-    # --- 5. VCP Tightness (Gap-Adjusted Close-to-Close) ---
-    # 條件：5天內 3.5%
-    recent_closes = close.tail(5)
-    closes_list = recent_closes.tolist()
+    # --- 5. VCP Tightness (Dynamic Gap Tolerance - 10 Days) ---
+    # 檢查近 10 天 (原為5天，改為10天以涵蓋完整旗型)
+    check_days = 10
+    recent_closes = close.tail(check_days).tolist()
+    recent_opens = open_price.tail(check_days).tolist()
     
-    # 跳空重置邏輯：若發現 > 4% 的跳空，重置計算起點
-    gap_threshold = 0.04 
+    gap_threshold = 0.04 # 觸發判定的跳空門檻
     valid_start_index = 0
+    allowed_tightness = 0.035 # 預設容許震幅 3.5%
     
-    for i in range(1, len(closes_list)):
-        prev_c = closes_list[i-1]
-        curr_c = closes_list[i]
-        daily_change = (curr_c - prev_c) / prev_c
+    for i in range(1, len(recent_closes)):
+        prev_c = recent_closes[i-1]
+        curr_o = recent_opens[i]
+        curr_c = recent_closes[i]
         
-        if daily_change > gap_threshold:
+        # A. 更新跳空判斷: Open vs Prev Close
+        gap_magnitude = (curr_o - prev_c) / prev_c
+        
+        if gap_magnitude > gap_threshold:
             valid_start_index = i # 重置起點至跳空當天
             
-    adjusted_closes = closes_list[valid_start_index:]
+            # B. 計算當日漲幅 (Close vs Prev Close)
+            day_gain_magnitude = (curr_c - prev_c) / prev_c
+            
+            # C. 取兩者較大值
+            max_magnitude = max(gap_magnitude, day_gain_magnitude)
+            
+            # D. 無條件進位至整數百分比 (例如 9.1% -> 10% -> 0.10)
+            allowed_tightness = math.ceil(max_magnitude * 100) / 100.0
+            
+    adjusted_closes = recent_closes[valid_start_index:]
     
-    # 只有一根K線無法算收斂，視為通過或略過 (此處設為通過，讓人工最後判斷)
+    # 只有一根K線無法算收斂，視為通過
     if len(adjusted_closes) < 2:
         pass 
     else:
@@ -144,7 +159,9 @@ def check_vcp_criteria(df, qqq_score=None):
         min_c = min(adjusted_closes)
         # 震幅算法：(高-低) / 最新價
         range_pct = (max_c - min_c) / current_c
-        if range_pct > 0.035: return False # > 3.5% 剔除
+        
+        # 使用動態計算的 allowed_tightness 進行過濾
+        if range_pct > allowed_tightness: return False 
 
     # --- 6. RS 強度檢查 (vs QQQ) ---
     if qqq_score is not None:
@@ -176,6 +193,7 @@ def diagnose_single_stock(df, symbol, qqq_df=None):
     vol = df['Volume']
     high = df['High']
     low = df['Low']
+    open_price = df['Open']
     c_now = close.iloc[-1]
     
     # 1. 基礎與流動性
@@ -226,29 +244,43 @@ def diagnose_single_stock(df, symbol, qqq_df=None):
         report.append(f"   ❌ 未見量縮: {vdu_ratio*100:.1f}% (> 70%)")
         is_pass = False
 
-    # 5. VCP Tightness (Gap Adjusted)
-    recent_closes = close.tail(5).tolist()
+    # 5. VCP Tightness (Dynamic Gap Logic - 10 Days)
+    check_days = 10
+    recent_closes = close.tail(check_days).tolist()
+    recent_opens = open_price.tail(check_days).tolist()
+    
     gap_threshold = 0.04
     valid_start_index = 0
+    allowed_tightness = 0.035 # Default
+    gap_msg = ""
+
     for i in range(1, len(recent_closes)):
-        prev = recent_closes[i-1]
-        curr = recent_closes[i]
-        if (curr - prev) / prev > gap_threshold:
+        prev_c = recent_closes[i-1]
+        curr_o = recent_opens[i]
+        curr_c = recent_closes[i]
+        
+        gap_mag = (curr_o - prev_c) / prev_c
+        
+        if gap_mag > gap_threshold:
             valid_start_index = i
+            day_gain_mag = (curr_c - prev_c) / prev_c
+            max_mag = max(gap_mag, day_gain_mag)
+            allowed_tightness = math.ceil(max_mag * 100) / 100.0
+            gap_msg = f"(Gap: {gap_mag*100:.1f}%, Allow: {allowed_tightness*100:.0f}%)"
             
     adjusted_closes = recent_closes[valid_start_index:]
     max_c = max(adjusted_closes)
     min_c = min(adjusted_closes)
     range_pct = (max_c - min_c) / c_now
     
-    report.append(f"\n🔹 **收斂度 (Gap Adjusted)**")
+    report.append(f"\n🔹 **收斂度 (Dynamic Gap, 10 Days)**")
     if valid_start_index > 0:
-        report.append(f"   ℹ️ 偵測到跳空，已重置計算起點")
+        report.append(f"   ℹ️ 偵測到跳空 {gap_msg}")
         
-    if range_pct <= 0.035:
-        report.append(f"   ✅ 5日震幅: {range_pct*100:.2f}% (<= 3.5%)")
+    if range_pct <= allowed_tightness:
+        report.append(f"   ✅ 10日震幅: {range_pct*100:.2f}% (<= {allowed_tightness*100:.1f}%)")
     else:
-        report.append(f"   ❌ 震幅過大: {range_pct*100:.2f}% (> 3.5%)")
+        report.append(f"   ❌ 震幅過大: {range_pct*100:.2f}% (> {allowed_tightness*100:.1f}%)")
         is_pass = False
 
     # 6. RS & Trend
