@@ -5,7 +5,8 @@ import yfinance as yf
 import asyncio
 import traceback
 import io
-import math  # 用於無條件進位計算
+import math
+import gc  # 引入垃圾回收
 from datetime import datetime, timedelta
 
 # 策略參數
@@ -15,10 +16,19 @@ import config as cfg
 def get_nasdaq_stock_list():
     """
     從 NASDAQ 獲取清單，並嚴格過濾 ETF, ADR, 權證, 特別股
+    (已加入 Timeout 與 User-Agent 防止在 Zeabur 上卡死)
     """
     try:
         url = "http://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
-        s = requests.get(url).content
+        # 模擬瀏覽器 Header，防止被擋
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        # 設定 Timeout，避免無限期等待導致容器被殺
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        s = response.content
         df = pd.read_csv(io.BytesIO(s), sep="|")
         
         # 1. 基礎清洗
@@ -55,7 +65,7 @@ def get_nasdaq_stock_list():
         return clean_list 
         
     except Exception as e:
-        print(f"❌ 獲取 NASDAQ 清單失敗: {e}")
+        print(f"❌ 獲取 NASDAQ 清單失敗 (使用備用清單): {e}")
         # 備案：回傳大型科技股
         return ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'TSLA', 'META', 'AMD', 'NFLX', 'GOOGL', 'AVGO']
 
@@ -92,17 +102,8 @@ def _safe_div(a, b, default=float("nan")):
 
 
 def compute_fallen_angel_rs_features(df_stock: pd.DataFrame, qqq_close: pd.Series):
-    """\
+    """
     Fallen Angel RS Gate（vs QQQ）。
-
-    回傳:
-      (pass_gate: bool, features: dict)
-
-    features 會包含你指定的欄位：
-      - leader_peak_excess（%）
-      - rs_near_high_pct（%）
-      - rs_dd_vs_price_dd（ratio）
-      - rs_ma20_slope（%）
     """
     features = {
         "leader_peak_excess": float("nan"),
@@ -196,24 +197,35 @@ def compute_fallen_angel_rs_features(df_stock: pd.DataFrame, qqq_close: pd.Serie
     return True, features
 
 
-def yf_download_with_retry(tickers, start, end, **kwargs):
-    """yfinance.download 包一層 retry + exponential backoff，避免偶發網路/節流失敗。"""
+def yf_download_sync_wrapper(tickers, start, end):
+    """
+    同步執行的下載函數，將由 asyncio.to_thread 呼叫。
+    包含 retry + exponential backoff。
+    """
     last_err = None
     for attempt in range(1, cfg.YF_MAX_RETRIES + 1):
         try:
-            return yf.download(tickers, start=start, end=end, progress=False, auto_adjust=True, **kwargs)
+            return yf.download(tickers, start=start, end=end, progress=False, auto_adjust=True)
         except Exception as e:
             last_err = e
-            wait = cfg.YF_BACKOFF_BASE_SEC * (2 ** (attempt - 1))
-            print(f"⚠️ yfinance 下載失敗 (attempt {attempt}/{cfg.YF_MAX_RETRIES}): {e} ; sleep {wait:.1f}s")
-            try:
-                import time
-                time.sleep(wait)
-            except Exception:
-                pass
+            # 簡單的 retry wait
+            import time
+            time.sleep(cfg.YF_BACKOFF_BASE_SEC * attempt)
+            
     if last_err:
-        raise last_err
+        print(f"⚠️ yfinance download failed: {last_err}")
     return pd.DataFrame()
+
+
+async def yf_download_with_retry(tickers, start, end):
+    """
+    [ASYNC FIX] 將同步的 yfinance 下載丟到 Thread 執行，
+    避免阻塞 Main Event Loop 導致 Telegram Bot 斷線。
+    """
+    loop = asyncio.get_running_loop()
+    # 使用 run_in_executor 在背景 thread 執行 blocking I/O
+    df = await loop.run_in_executor(None, yf_download_sync_wrapper, tickers, start, end)
+    return df
 
 
 # --- C. VCP 策略檢查邏輯 (含 Dynamic Gap Reset & 10天視窗) ---
@@ -466,8 +478,8 @@ async def scan_market(target_date_str):
         formatted_date = target_date.strftime('%Y-%m-%d')
         print(f"🚀 開始掃描: {formatted_date}")
 
-        # 1. 基準 QQQ（Bench）
-        qqq_data = yf_download_with_retry(cfg.BENCH_SYMBOL, start=start_date, end=end_date)
+        # 1. 基準 QQQ（Bench）(使用 Async Wrapper)
+        qqq_data = await yf_download_with_retry(cfg.BENCH_SYMBOL, start=start_date, end=end_date)
         if qqq_data.empty:
             print("❌ 無法取得 QQQ 資料")
             return [], formatted_date
@@ -476,6 +488,8 @@ async def scan_market(target_date_str):
         qqq_close = qqq_close.dropna()
 
         # 2. 獲取並過濾清單
+        # 注意：這個 get_nasdaq_stock_list 裡面的 requests 仍是同步的，但因為很快所以沒關係
+        # 若想更極致可也包進 to_thread
         tickers = get_nasdaq_stock_list()
         
         batch_size = cfg.YF_BATCH_SIZE 
@@ -484,7 +498,9 @@ async def scan_market(target_date_str):
         for i in range(0, len(tickers), batch_size):
             batch = tickers[i:i+batch_size]
             try:
-                data = yf_download_with_retry(batch, start=start_date, end=end_date, group_by='ticker', threads=True)
+                # [FIX] 這裡使用 await 調用非阻塞的 download wrapper
+                data = await yf_download_with_retry(batch, start=start_date, end=end_date)
+                
                 if data.empty: continue
 
                 for symbol in batch:
@@ -510,6 +526,10 @@ async def scan_market(target_date_str):
                             })
                     except: continue
                 
+                # [FIX] 明確釋放記憶體
+                del data
+                gc.collect()
+                
                 await asyncio.sleep(cfg.YF_SLEEP_BETWEEN_BATCH_SEC)
             except Exception as e:
                 print(f"Batch Error: {e}")
@@ -530,7 +550,8 @@ async def fetch_and_diagnose(symbol_input, date_str):
         formatted_date = target_date.strftime('%Y-%m-%d')
         symbol = symbol_input.upper().strip().replace(".", "-")
 
-        data = yf_download_with_retry([symbol, cfg.BENCH_SYMBOL], start=start_date, end=end_date, group_by='ticker')
+        # [FIX] 使用 Async Wrapper
+        data = await yf_download_with_retry([symbol, cfg.BENCH_SYMBOL], start=start_date, end=end_date)
         
         if symbol not in data.columns.levels[0]:
             return False, f"❌ 找不到: {symbol}", formatted_date
