@@ -1,16 +1,19 @@
-# 1. 機器人與基礎工具 (不鎖版本，讓 pip 抓最新的穩定版)
+# 1. 建置輔助 (優先安裝，幫助 pip 正確識別環境)
+wheel
+setuptools
+
+# 2. 機器人核心
 python-telegram-bot[job-queue]
 APScheduler
 python-dotenv
 pytz
 
-# 2. 關鍵限制 (絕對不能拿掉！)
-# pandas_ta 不支援 numpy 2.0+，必須鎖定在 2.0 以下
-# 加上這個限制後，pip 會自動幫你找一個「支援 numpy<2.0」且「有現成安裝檔」的 pandas 版本
+# 3. 關鍵限制 (絕對不能拿掉！)
+# 只要鎖住 numpy 不要升上 2.0，其他套件讓 pip 自動去配對最穩定的版本
 numpy<2.0.0
 
-# 3. 資料科學套件 (不鎖版本)
-# 這樣 pip 就會去找跟上面 numpy<2.0 相容，且不用編譯的 pandas 版本
+# 4. 資料科學套件 (不鎖版本)
+# pip 會自動尋找支援上述 numpy 版本且有 "Binary Wheel" (免編譯) 的最新 pandas
 pandas
 pandas_ta
 yfinance
