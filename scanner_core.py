@@ -1,12 +1,13 @@
 import requests
 import pandas as pd
-import pandas_ta as ta
+# [FIX] 移除 pandas_ta 引用，避免依賴衝突
+# import pandas_ta as ta 
 import yfinance as yf
 import asyncio
 import traceback
 import io
 import math
-import gc  # 引入垃圾回收
+import gc
 from datetime import datetime, timedelta
 
 # 策略參數
@@ -20,45 +21,35 @@ def get_nasdaq_stock_list():
     """
     try:
         url = "http://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
-        # 模擬瀏覽器 Header，防止被擋
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        # 設定 Timeout，避免無限期等待導致容器被殺
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         
         s = response.content
         df = pd.read_csv(io.BytesIO(s), sep="|")
         
-        # 1. 基礎清洗
         df = df.dropna(subset=['Symbol'])
-        df = df[df['Test Issue'] == 'N'] # 排除測試代碼
+        df = df[df['Test Issue'] == 'N']
         
-        # 2. 排除 ETF
         if 'ETF' in df.columns:
             df = df[df['ETF'] == 'N']
             
-        # 3. 利用名稱排除 ADR, 特別股, 權證
-        # 轉大寫以利比對
         df['Security Name'] = df['Security Name'].str.upper()
         
-        # 定義排除關鍵字
         exclude_keywords = [
-            ' ADR ', ' ADS ', ' DEPOSITARY ', # ADR 相關
-            ' PREFERRED ', ' PFD ',           # 特別股
-            ' WARRANT ', ' WTS ', ' UNIT ',   # 權證與單位
-            ' RIGHTS ',                       # 認股權
-            ' ACQUISITION '                   # SPAC 相關
+            ' ADR ', ' ADS ', ' DEPOSITARY ',
+            ' PREFERRED ', ' PFD ',
+            ' WARRANT ', ' WTS ', ' UNIT ',
+            ' RIGHTS ',
+            ' ACQUISITION '
         ]
         
         for kw in exclude_keywords:
             df = df[~df['Security Name'].str.contains(kw, na=False)]
 
-        # 4. 符號長度過濾 (NASDAQ 通常 4 碼)
         full_list = df['Symbol'].tolist()
-        
-        # 清除包含非字母的符號
         clean_list = [x for x in full_list if x.isalpha()]
         
         print(f"✅ 成功獲取 {len(clean_list)} 檔 NASDAQ 本土股票 (已排除 ETF/ADR/權證)")
@@ -66,12 +57,10 @@ def get_nasdaq_stock_list():
         
     except Exception as e:
         print(f"❌ 獲取 NASDAQ 清單失敗 (使用備用清單): {e}")
-        # 備案：回傳大型科技股
         return ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'TSLA', 'META', 'AMD', 'NFLX', 'GOOGL', 'AVGO']
 
 # --- B. 輔助計算: RS Score ---
 def calculate_performance_score(close_series):
-    """計算 IBD 風格的 RS Score (40%/20%/20%/20%)"""
     if len(close_series) < 260: return -999
     try:
         c_now = close_series.iloc[-1]
@@ -91,7 +80,6 @@ def calculate_performance_score(close_series):
         return -999
 
 # --- B2. Fallen Angel RS：指標計算與 Gate ---
-
 def _safe_div(a, b, default=float("nan")):
     try:
         if b == 0 or pd.isna(b):
@@ -100,11 +88,7 @@ def _safe_div(a, b, default=float("nan")):
     except Exception:
         return default
 
-
 def compute_fallen_angel_rs_features(df_stock: pd.DataFrame, qqq_close: pd.Series):
-    """
-    Fallen Angel RS Gate（vs QQQ）。
-    """
     features = {
         "leader_peak_excess": float("nan"),
         "rs_near_high_pct": float("nan"),
@@ -124,11 +108,9 @@ def compute_fallen_angel_rs_features(df_stock: pd.DataFrame, qqq_close: pd.Serie
 
     close_s = aligned.iloc[:, 0]
     close_b = aligned.iloc[:, 1]
-
-    # RS line
     rs_line = close_s / close_b
 
-    # ---------- A) Leader Peak ----------
+    # Leader Peak
     ex3 = (close_s.pct_change(63) - close_b.pct_change(63)).tail(cfg.LEADER_PEAK_LOOKBACK_D)
     ex6 = (close_s.pct_change(126) - close_b.pct_change(126)).tail(cfg.LEADER_PEAK_LOOKBACK_D)
 
@@ -145,7 +127,7 @@ def compute_fallen_angel_rs_features(df_stock: pd.DataFrame, qqq_close: pd.Serie
     if not leader_ok:
         return False, features
 
-    # ---------- B) Resilience ----------
+    # Resilience
     lb = cfg.RESILIENCE_LOOKBACK_D
     if aligned.shape[0] < lb + 5:
         return False, features
@@ -169,7 +151,6 @@ def compute_fallen_angel_rs_features(df_stock: pd.DataFrame, qqq_close: pd.Serie
     if pd.notna(ratio):
         features["rs_dd_vs_price_dd"] = float(ratio)
 
-    # 價格回撤區間
     if pd.isna(price_dd) or not (cfg.MIN_PRICE_DD <= price_dd <= cfg.MAX_PRICE_DD):
         return False, features
 
@@ -178,7 +159,7 @@ def compute_fallen_angel_rs_features(df_stock: pd.DataFrame, qqq_close: pd.Serie
     if not resilience_ok:
         return False, features
 
-    # ---------- C) Turn-up ----------
+    # Turn-up
     rs_ma20 = rs_line.rolling(cfg.RS_MA_LEN).mean()
     if rs_ma20.isna().iloc[-1]:
         return False, features
@@ -196,137 +177,101 @@ def compute_fallen_angel_rs_features(df_stock: pd.DataFrame, qqq_close: pd.Serie
 
     return True, features
 
-
 def yf_download_sync_wrapper(tickers, start, end):
-    """
-    同步執行的下載函數，將由 asyncio.to_thread 呼叫。
-    包含 retry + exponential backoff。
-    """
     last_err = None
     for attempt in range(1, cfg.YF_MAX_RETRIES + 1):
         try:
             return yf.download(tickers, start=start, end=end, progress=False, auto_adjust=True)
         except Exception as e:
             last_err = e
-            # 簡單的 retry wait
             import time
             time.sleep(cfg.YF_BACKOFF_BASE_SEC * attempt)
-            
     if last_err:
         print(f"⚠️ yfinance download failed: {last_err}")
     return pd.DataFrame()
 
-
 async def yf_download_with_retry(tickers, start, end):
-    """
-    [ASYNC FIX] 將同步的 yfinance 下載丟到 Thread 執行，
-    避免阻塞 Main Event Loop 導致 Telegram Bot 斷線。
-    """
     loop = asyncio.get_running_loop()
-    # 使用 run_in_executor 在背景 thread 執行 blocking I/O
     df = await loop.run_in_executor(None, yf_download_sync_wrapper, tickers, start, end)
     return df
 
-
-# --- C. VCP 策略檢查邏輯 (含 Dynamic Gap Reset & 10天視窗) ---
+# --- C. VCP 策略檢查邏輯 ---
 def check_vcp_criteria(df, qqq_close=None):
-    """
-    回傳 True/False
-    """
-    # 0. 資料長度 (需 > 260 天算 RS 與 52週低點)
     if len(df) < 260: return False
     
     close = df['Close']
     vol = df['Volume']
     high = df['High']
     low = df['Low']
-    open_price = df['Open'] # 需獲取 Open 計算跳空
+    open_price = df['Open']
     
     current_c = close.iloc[-1]
     
-    # --- 1. 基礎門檻 (Basic Filters) ---
-    # 股價 > 10 美元
+    # 1. 基礎門檻
     if current_c < cfg.MIN_PRICE: return False
     
-    # 流動性 > 2000 萬美元 (使用 20日均量計算)
     avg_vol_20 = vol.tail(20).mean()
     dollar_vol = current_c * avg_vol_20
-    if dollar_vol < cfg.MIN_DOLLAR_VOL_20D: return False # 20M USD
+    if dollar_vol < cfg.MIN_DOLLAR_VOL_20D: return False
 
-    # --- 2. 位階控制 (Relative Position) ---
-    # 股價需高於 52 週 (250天) 最低價的 25%
+    # 2. 位階控制
     low_52w = low.tail(250).min()
     if current_c < (low_52w * cfg.LOW_52W_MULTIPLIER): return False
 
-    # --- 3. 整理期判定 (Consolidation Logic) ---
-    # 過去 60 日內的高低點落差不得超過 30%
+    # 3. 整理期判定
     high_60 = high.tail(60).max()
     low_60 = low.tail(60).min()
     consolidation_depth = (high_60 - low_60) / high_60
     if consolidation_depth > cfg.CONSOLIDATION_MAX_DEPTH_60D: return False
 
-    # --- 4. 成交量 VDU (Volume Dry-Up) ---
-    # 近 3 日平均成交量 < 近 20 日平均成交量 * 70%
+    # 4. 成交量 VDU
     avg_vol_3 = vol.tail(3).mean()
     if avg_vol_3 >= (avg_vol_20 * cfg.VDU_MAX_RATIO): return False
 
-    # --- 5. VCP Tightness (Dynamic Gap Tolerance - 10 Days) ---
-    # 檢查近 10 天 (原為5天，改為10天以涵蓋完整旗型)
+    # 5. VCP Tightness (Dynamic Gap)
     check_days = cfg.VCP_TIGHT_DAYS
     recent_closes = close.tail(check_days).tolist()
     recent_opens = open_price.tail(check_days).tolist()
     
-    gap_threshold = cfg.VCP_GAP_THRESHOLD # 觸發判定的跳空門檻
+    gap_threshold = cfg.VCP_GAP_THRESHOLD
     valid_start_index = 0
-    allowed_tightness = cfg.VCP_DEFAULT_TIGHTNESS # 預設容許震幅 3.5%
+    allowed_tightness = cfg.VCP_DEFAULT_TIGHTNESS
     
     for i in range(1, len(recent_closes)):
         prev_c = recent_closes[i-1]
         curr_o = recent_opens[i]
         curr_c = recent_closes[i]
-        
-        # A. 更新跳空判斷: Open vs Prev Close
         gap_magnitude = (curr_o - prev_c) / prev_c
         
         if gap_magnitude > gap_threshold:
-            valid_start_index = i # 重置起點至跳空當天
-            
-            # B. 計算當日漲幅 (Close vs Prev Close)
+            valid_start_index = i
             day_gain_magnitude = (curr_c - prev_c) / prev_c
-            
-            # C. 取兩者較大值
             max_magnitude = max(gap_magnitude, day_gain_magnitude)
-            
-            # D. 無條件進位至整數百分比 (例如 9.1% -> 10% -> 0.10)
             allowed_tightness = math.ceil(max_magnitude * 100) / 100.0
             
     adjusted_closes = recent_closes[valid_start_index:]
     
-    # 只有一根K線無法算收斂，視為通過
-    if len(adjusted_closes) < 2:
-        pass 
-    else:
+    if len(adjusted_closes) >= 2:
         max_c = max(adjusted_closes)
         min_c = min(adjusted_closes)
-        # 震幅算法：(高-低) / 最新價
         range_pct = (max_c - min_c) / current_c
-        
-        # 使用動態計算的 allowed_tightness 進行過濾
         if range_pct > allowed_tightness: return False 
 
-    # --- 6. RS Fallen Angel Gate (vs QQQ) ---
+    # 6. RS Fallen Angel Gate
     if qqq_close is not None:
         rs_pass, _ = compute_fallen_angel_rs_features(df, qqq_close)
         if not rs_pass:
             return False
 
-    # --- 7. 趨勢濾網 (Trend) ---
-    # 股價 > 50MA > 200MA
-    sma50 = ta.sma(close, length=50)
-    sma200 = ta.sma(close, length=200)
-    if sma50 is None or sma200 is None: return False
+    # 7. 趨勢濾網 (Trend) [FIX: 改用原生 Pandas 計算 MA]
+    # sma50 = ta.sma(close, length=50)   <-- 舊的寫法 (依賴 pandas_ta)
+    # sma200 = ta.sma(close, length=200) <-- 舊的寫法
     
-    # 確保 50MA 與 200MA 趨勢正確
+    sma50 = close.rolling(window=50).mean()
+    sma200 = close.rolling(window=200).mean()
+    
+    if sma50.isna().iloc[-1] or sma200.isna().iloc[-1]: return False
+    
     if current_c < sma50.iloc[-1]: return False
     if sma50.iloc[-1] < sma200.iloc[-1]: return False
 
@@ -348,117 +293,107 @@ def diagnose_single_stock(df, symbol, qqq_df=None):
     open_price = df['Open']
     c_now = close.iloc[-1]
     
-    # 1. 基礎與流動性
+    # 1. 基礎
     avg_vol_20 = vol.tail(20).mean()
     dollar_vol = c_now * avg_vol_20
-    
     report.append(f"🔹 **基礎門檻**")
-    if c_now >= 10:
-        report.append(f"   ✅ 股價: ${c_now:.2f} (>= $10)")
+    if c_now >= 10: report.append(f"   ✅ 股價: ${c_now:.2f}")
     else:
-        report.append(f"   ❌ 股價: ${c_now:.2f} (< $10)")
+        report.append(f"   ❌ 股價: ${c_now:.2f}")
         is_pass = False
-        
-    if dollar_vol >= 20000000:
-        report.append(f"   ✅ 日均成交額: ${dollar_vol/1000000:.1f}M (>= $20M)")
+    if dollar_vol >= 20000000: report.append(f"   ✅ 日均成交: ${dollar_vol/1000000:.1f}M")
     else:
-        report.append(f"   ❌ 日均成交額: ${dollar_vol/1000000:.1f}M (< $20M)")
+        report.append(f"   ❌ 日均成交: ${dollar_vol/1000000:.1f}M")
         is_pass = False
 
-    # 2. 位階控制
+    # 2. 位階
     low_52w = low.tail(250).min()
     dist_low = (c_now - low_52w) / low_52w
-    report.append(f"\n🔹 **位階 (vs 52W Low)**")
-    if c_now >= low_52w * 1.25:
-        report.append(f"   ✅ 高於年低點: +{dist_low*100:.1f}% (>= 25%)")
+    report.append(f"\n🔹 **位階**")
+    if c_now >= low_52w * 1.25: report.append(f"   ✅ >年低點: +{dist_low*100:.1f}%")
     else:
-        report.append(f"   ❌ 離底太近: +{dist_low*100:.1f}% (< 25%)")
+        report.append(f"   ❌ 離底太近: +{dist_low*100:.1f}%")
         is_pass = False
 
-    # 3. 整理型態
+    # 3. 整理
     high_60 = high.tail(60).max()
     low_60 = low.tail(60).min()
     depth = (high_60 - low_60) / high_60
-    report.append(f"\n🔹 **整理型態 (60天內)**")
-    if depth <= 0.30:
-        report.append(f"   ✅ 修正幅度: -{depth*100:.1f}% (<= 30%)")
+    report.append(f"\n🔹 **整理 (60d)**")
+    if depth <= 0.30: report.append(f"   ✅ 深度: -{depth*100:.1f}%")
     else:
-        report.append(f"   ❌ 波動過大: -{depth*100:.1f}% (> 30%)")
+        report.append(f"   ❌ 過深: -{depth*100:.1f}%")
         is_pass = False
 
-    # 4. VDU (Volume Dry-Up)
+    # 4. VDU
     avg_vol_3 = vol.tail(3).mean()
     vdu_ratio = avg_vol_3 / avg_vol_20
-    report.append(f"\n🔹 **成交量 VDU**")
-    if vdu_ratio < 0.70:
-        report.append(f"   ✅ 量縮顯著: {vdu_ratio*100:.1f}% (Target < 70%)")
+    report.append(f"\n🔹 **VDU**")
+    if vdu_ratio < 0.70: report.append(f"   ✅ 量縮: {vdu_ratio*100:.1f}%")
     else:
-        report.append(f"   ❌ 未見量縮: {vdu_ratio*100:.1f}% (> 70%)")
+        report.append(f"   ❌ 未量縮: {vdu_ratio*100:.1f}%")
         is_pass = False
 
-    # 5. VCP Tightness (Dynamic Gap Logic - 10 Days)
+    # 5. VCP Tightness
     check_days = cfg.VCP_TIGHT_DAYS
     recent_closes = close.tail(check_days).tolist()
     recent_opens = open_price.tail(check_days).tolist()
-    
     gap_threshold = cfg.VCP_GAP_THRESHOLD
     valid_start_index = 0
-    allowed_tightness = 0.035 # Default
+    allowed_tightness = 0.035
     gap_msg = ""
-
+    
     for i in range(1, len(recent_closes)):
         prev_c = recent_closes[i-1]
         curr_o = recent_opens[i]
         curr_c = recent_closes[i]
-        
         gap_mag = (curr_o - prev_c) / prev_c
-        
         if gap_mag > gap_threshold:
             valid_start_index = i
             day_gain_mag = (curr_c - prev_c) / prev_c
             max_mag = max(gap_mag, day_gain_mag)
             allowed_tightness = math.ceil(max_mag * 100) / 100.0
-            gap_msg = f"(Gap: {gap_mag*100:.1f}%, Allow: {allowed_tightness*100:.0f}%)"
+            gap_msg = f"(Gap:{gap_mag*100:.1f}%)"
             
     adjusted_closes = recent_closes[valid_start_index:]
     max_c = max(adjusted_closes)
     min_c = min(adjusted_closes)
     range_pct = (max_c - min_c) / c_now
     
-    report.append(f"\n🔹 **收斂度 (Dynamic Gap, 10 Days)**")
-    if valid_start_index > 0:
-        report.append(f"   ℹ️ 偵測到跳空 {gap_msg}")
-        
+    report.append(f"\n🔹 **收斂 ({check_days}d)**")
+    if valid_start_index>0: report.append(f"   ℹ️ 跳空 {gap_msg}")
+    
     if range_pct <= allowed_tightness:
-        report.append(f"   ✅ 10日震幅: {range_pct*100:.2f}% (<= {allowed_tightness*100:.1f}%)")
+        report.append(f"   ✅ 震幅: {range_pct*100:.2f}% (Limit: {allowed_tightness*100:.1f}%)")
     else:
-        report.append(f"   ❌ 震幅過大: {range_pct*100:.2f}% (> {allowed_tightness*100:.1f}%)")
+        report.append(f"   ❌ 震幅過大: {range_pct*100:.2f}%")
         is_pass = False
 
-    # 6. RS (Fallen Angel) & Trend
-    if qqq_df is not None and not qqq_df.empty:
+    # 6. RS
+    if qqq_df is not None:
         rs_pass, feat = compute_fallen_angel_rs_features(df, qqq_df['Close'])
-        report.append(f"\n🔹 **Fallen Angel RS (vs QQQ)**")
+        report.append(f"\n🔹 **RS Gate**")
         lp = feat.get('leader_peak_excess')
         nh = feat.get('rs_near_high_pct')
         ratio = feat.get('rs_dd_vs_price_dd')
         slope = feat.get('rs_ma20_slope')
-        report.append(f"   • leader_peak_excess: {lp:.2f}%" if pd.notna(lp) else "   • leader_peak_excess: N/A")
-        report.append(f"   • rs_near_high%: {nh:.2f}%" if pd.notna(nh) else "   • rs_near_high%: N/A")
-        report.append(f"   • rs_dd_vs_price_dd: {ratio:.3f}" if pd.notna(ratio) else "   • rs_dd_vs_price_dd: N/A")
-        report.append(f"   • RS_ma20_slope: {slope:.2f}%" if pd.notna(slope) else "   • RS_ma20_slope: N/A")
-
-        if rs_pass:
-            report.append("   ✅ RS Gate: PASS")
+        report.append(f"   • Peak Exc: {lp:.2f}%" if pd.notna(lp) else "   • Peak Exc: N/A")
+        report.append(f"   • Near High: {nh:.2f}%" if pd.notna(nh) else "   • Near High: N/A")
+        report.append(f"   • DD Ratio: {ratio:.2f}" if pd.notna(ratio) else "   • DD Ratio: N/A")
+        
+        if rs_pass: report.append("   ✅ PASS")
         else:
-            report.append("   ❌ RS Gate: FAIL")
+            report.append("   ❌ FAIL")
             is_pass = False
 
-    sma50 = ta.sma(close, length=50).iloc[-1]
-    sma200 = ta.sma(close, length=200).iloc[-1]
+    # 7. Trend [FIX: 原生 Pandas]
+    # sma50 = ta.sma(close, length=50).iloc[-1]
+    # sma200 = ta.sma(close, length=200).iloc[-1]
+    sma50 = close.rolling(window=50).mean().iloc[-1]
+    sma200 = close.rolling(window=200).mean().iloc[-1]
     
     if c_now > sma50 and sma50 > sma200:
-        report.append(f"   ✅ 多頭排列 (P > 50MA > 200MA)")
+        report.append(f"   ✅ 多頭 (P > 50 > 200)")
     else:
         report.append(f"   ❌ 趨勢不符")
         is_pass = False
@@ -478,7 +413,6 @@ async def scan_market(target_date_str):
         formatted_date = target_date.strftime('%Y-%m-%d')
         print(f"🚀 開始掃描: {formatted_date}")
 
-        # 1. 基準 QQQ（Bench）(使用 Async Wrapper)
         qqq_data = await yf_download_with_retry(cfg.BENCH_SYMBOL, start=start_date, end=end_date)
         if qqq_data.empty:
             print("❌ 無法取得 QQQ 資料")
@@ -487,20 +421,14 @@ async def scan_market(target_date_str):
         qqq_close = qqq_data['Close'] if not isinstance(qqq_data.columns, pd.MultiIndex) else qqq_data['Close'][cfg.BENCH_SYMBOL]
         qqq_close = qqq_close.dropna()
 
-        # 2. 獲取並過濾清單
-        # 注意：這個 get_nasdaq_stock_list 裡面的 requests 仍是同步的，但因為很快所以沒關係
-        # 若想更極致可也包進 to_thread
         tickers = get_nasdaq_stock_list()
-        
         batch_size = cfg.YF_BATCH_SIZE 
         rows = []
 
         for i in range(0, len(tickers), batch_size):
             batch = tickers[i:i+batch_size]
             try:
-                # [FIX] 這裡使用 await 調用非阻塞的 download wrapper
                 data = await yf_download_with_retry(batch, start=start_date, end=end_date)
-                
                 if data.empty: continue
 
                 for symbol in batch:
@@ -511,7 +439,6 @@ async def scan_market(target_date_str):
                         df.dropna(inplace=True)
                         if df.empty: continue
                         
-                        # 日期檢查
                         last_dt = df.index[-1].date()
                         if abs((last_dt - target_date.date()).days) > 1: continue
                         
@@ -526,10 +453,8 @@ async def scan_market(target_date_str):
                             })
                     except: continue
                 
-                # [FIX] 明確釋放記憶體
                 del data
                 gc.collect()
-                
                 await asyncio.sleep(cfg.YF_SLEEP_BETWEEN_BATCH_SEC)
             except Exception as e:
                 print(f"Batch Error: {e}")
@@ -550,7 +475,6 @@ async def fetch_and_diagnose(symbol_input, date_str):
         formatted_date = target_date.strftime('%Y-%m-%d')
         symbol = symbol_input.upper().strip().replace(".", "-")
 
-        # [FIX] 使用 Async Wrapper
         data = await yf_download_with_retry([symbol, cfg.BENCH_SYMBOL], start=start_date, end=end_date)
         
         if symbol not in data.columns.levels[0]:
