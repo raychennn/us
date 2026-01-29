@@ -2,191 +2,287 @@ import os
 import io
 import asyncio
 import logging
+from datetime import datetime, timedelta, time as dtime
+
 import pytz
 import pandas as pd
-from datetime import datetime, time as dtime
-
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from dotenv import load_dotenv
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 import config as cfg
 from scanner_core import scan_market, fetch_and_diagnose
 
 load_dotenv()
-TG_TOKEN = os.getenv('TG_TOKEN')
-TG_CHAT_ID = os.getenv('TG_CHAT_ID')
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
+
+# -----------------------
+# Output helpers
+# -----------------------
 def make_tradingview_text(rows):
+    """
+    TradingView 匯入清單：每個 symbol 之間用區塊間隔（預設空一行）。
+    可透過 config.py 調整 TRADINGVIEW_PREFIX / TRADINGVIEW_BLOCK_SEPARATOR。
+    """
     symbols = []
     for r in rows:
-        s = str(r.get('Symbol', '')).strip()
+        s = str(r.get("Symbol", "")).strip()
         if not s:
             continue
         symbols.append(f"{cfg.TRADINGVIEW_PREFIX}{s}" if cfg.TRADINGVIEW_PREFIX else s)
-    return cfg.TRADINGVIEW_BLOCK_SEPARATOR.join(symbols)
 
-def make_csv_bytes(rows, formatted_date):
-    df = pd.DataFrame(rows).copy()
-    bio = io.BytesIO(df.to_csv(index=False).encode('utf-8'))
-    bio.name = f"NASDAQ_FallenAngel_{formatted_date.replace('-', '')}.csv"
-    return bio, df
+    return cfg.TRADINGVIEW_BLOCK_SEPARATOR.join(symbols) + ("\n" if symbols else "")
 
-def make_txt_bytes(text, formatted_date):
-    bio = io.BytesIO(text.encode('utf-8'))
-    bio.name = f"NASDAQ_FallenAngel_{formatted_date.replace('-', '')}.txt"
+
+def make_txt_bytes(text, date_label):
+    bio = io.BytesIO(text.encode("utf-8"))
+    bio.name = f"tradingview_list_{date_label}.txt"
+    bio.seek(0)
     return bio
 
-async def run_full_scan_background(chat_id, context, date_str, label):
+
+def make_csv_bytes(rows, date_label):
+    df = pd.DataFrame(rows)
+    bio = io.BytesIO()
+    df.to_csv(bio, index=False, encoding="utf-8-sig")
+    bio.name = f"scan_result_{date_label}.csv"
+    bio.seek(0)
+    return bio, df
+
+
+# -----------------------
+# Core actions
+# -----------------------
+async def execute_scan(bot, chat_id: str, date_str: str | None, tag: str):
+    """
+    跑掃描並把摘要 + TradingView txt + CSV 明細傳回 Telegram。
+    date_str: None 或 "yymmdd"
+    """
+    if not chat_id:
+        raise RuntimeError("TG_CHAT_ID not set (Zeabur Env)")
+
+    # 這裡 date_str 用於 scan_market 的「回測日期」功能（yymmdd）
+    rows, formatted_date = scan_market(date_str)
+
+    # 預覽前 20
+    preview_lines = []
+    for r in rows[:20]:
+        sym = r.get("Symbol", "")
+        lp = r.get("leader_peak_excess", "")
+        near = r.get("rs_near_high_pct", "")
+        ratio = r.get("rs_dd_vs_price_dd", "")
+        slope = r.get("RS_ma20_slope", "")
+        preview_lines.append(f"- {sym} | peak_excess:{lp} | rs_near_high:{near} | dd_ratio:{ratio} | slope:{slope}")
+
+    preview_text = "\n".join(preview_lines) if preview_lines else "(no results)"
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"✅ **{formatted_date} 掃描完成**（{tag}）\n"
+            f"共 {len(rows)} 檔\n"
+            f"前 20 檔預覽：\n{preview_text}"
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # TradingView TXT（區塊間隔）
+    tv_text = make_tradingview_text(rows)
+    txt_bio = make_txt_bytes(tv_text, formatted_date)
+
+    # CSV（含欄位）
+    csv_bio, _df = make_csv_bytes(rows, formatted_date)
+
+    await bot.send_document(
+        chat_id=chat_id,
+        document=txt_bio,
+        caption=f"📄 TradingView 匯入清單（區塊間隔）\n{formatted_date} / {len(rows)} 檔",
+    )
+
+    await bot.send_document(
+        chat_id=chat_id,
+        document=csv_bio,
+        caption=(
+            "📊 指標明細（CSV）\n"
+            "欄位：leader_peak_excess, rs_near_high%, rs_dd_vs_price_dd, RS_ma20_slope"
+        ),
+    )
+
+
+async def scheduled_scan_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(f"🇺🇸 正在執行 {label} NASDAQ 全市場掃描\n"
-                  f"策略：VCP/Trend + Fallen Angel RS (Bench={cfg.BENCH_SYMBOL})\n"
-                  f"資料尺度：{cfg.HIST_CALENDAR_DAYS} 日曆天\n"
-                  f"⏳ 視 NASDAQ 檔數與 Yahoo 節流情況，可能需要幾分鐘")
-        )
-
-        rows, formatted_date = await scan_market(date_str)
-
-        # 依 RS 轉強優先排序（第二波候選更直觀）
-        try:
-            rows = sorted(
-                rows,
-                key=lambda r: (
-                    float(r.get('RS_ma20_slope') if r.get('RS_ma20_slope') is not None else -1e9),
-                    float(r.get('leader_peak_excess') if r.get('leader_peak_excess') is not None else -1e9),
-                ),
-                reverse=True,
-            )
-        except Exception:
-            pass
-
-        if not rows:
-            await context.bot.send_message(chat_id=chat_id, text=f"📉 {formatted_date} 掃描無符合標的。")
-            return
-
-        # 摘要訊息
-        top_preview = [r.get('Symbol') for r in rows[:20] if r.get('Symbol')]
-        preview_text = ", ".join(top_preview)
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(f"✅ **{formatted_date} 掃描完成**\n"
-                  f"共 {len(rows)} 檔\n"
-                  f"前 20 檔預覽：\n{preview_text}"),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        # TradingView TXT（區塊間隔）
-        tv_text = make_tradingview_text(rows)
-        txt_bio = make_txt_bytes(tv_text, formatted_date)
-
-        # CSV（含欄位）
-        csv_bio, _df = make_csv_bytes(rows, formatted_date)
-
-        # 依序傳送 TXT + CSV（你要：同時訊息 + txt 檔）
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=txt_bio,
-            caption=(f"📄 TradingView 匯入清單（區塊間隔）\n{formatted_date} / {len(rows)} 檔")
-        )
-
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=csv_bio,
-            caption=("📊 指標明細（CSV）\n"
-
-                     "欄位：leader_peak_excess, rs_near_high%, rs_dd_vs_price_dd, RS_ma20_slope")
-        )
-
+        await execute_scan(context.bot, TG_CHAT_ID, None, "Scheduled")
     except Exception as e:
-        logger.exception("Scan failed")
+        logger.exception("Scheduled scan failed")
+        if TG_CHAT_ID:
+            await context.bot.send_message(chat_id=TG_CHAT_ID, text=f"⚠️ 排程掃描失敗: {e}")
+
+
+# -----------------------
+# Manual scheduler fallback (when JobQueue is unavailable)
+# -----------------------
+def _next_run_ny(now_ny: datetime) -> datetime:
+    """Return the next run datetime in NY tz using cfg schedule settings."""
+    run_dt = now_ny.replace(
+        hour=cfg.SCHEDULE_HOUR,
+        minute=cfg.SCHEDULE_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+
+    # if time passed today, move to tomorrow
+    if run_dt <= now_ny:
+        run_dt = run_dt + timedelta(days=1)
+
+    # ensure weekday matches
+    while run_dt.weekday() not in cfg.SCHEDULE_WEEKDAYS:
+        run_dt = run_dt + timedelta(days=1)
+
+    return run_dt
+
+
+async def manual_scheduler_loop(app):
+    """
+    如果 python-telegram-bot 沒有安裝 job-queue 依賴（導致 app.job_queue=None），
+    這裡用 asyncio 自己做每天固定時間觸發。
+    """
+    tz_ny = pytz.timezone(cfg.SCHEDULE_TZ)
+    logger.warning("JobQueue unavailable; using manual scheduler loop.")
+
+    while True:
+        try:
+            now_ny = datetime.now(tz_ny)
+            nxt = _next_run_ny(now_ny)
+            sleep_sec = max(1, int((nxt - now_ny).total_seconds()))
+            logger.info("Next scheduled scan at %s (sleep %ss)", nxt.isoformat(), sleep_sec)
+            await asyncio.sleep(sleep_sec)
+
+            # run
+            if TG_CHAT_ID:
+                await execute_scan(app.bot, TG_CHAT_ID, None, "Scheduled(manual)")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("manual_scheduler_loop error")
+            await asyncio.sleep(30)
+
+
+def schedule_daily_scan(app):
+    tz_ny = pytz.timezone(cfg.SCHEDULE_TZ)
+
+    if getattr(app, "job_queue", None) is not None:
+        try:
+            app.job_queue.run_daily(
+                scheduled_scan_job,
+                time=dtime(hour=cfg.SCHEDULE_HOUR, minute=cfg.SCHEDULE_MINUTE),
+                days=cfg.SCHEDULE_WEEKDAYS,
+                tzinfo=tz_ny,
+            )
+            logger.info("Scheduled scan registered via JobQueue (%s)", cfg.SCHEDULE_TZ)
+            return
+        except Exception:
+            logger.exception("Failed to register JobQueue schedule. Falling back to manual scheduler.")
+
+    # fallback
+    app.create_task(manual_scheduler_loop(app))
+
+
+# -----------------------
+# Telegram handlers
+# -----------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 US Stock Bot\n"
+        "/now 立即掃描\n"
+        "/yymmdd 回測日期掃描（例：/240101）\n"
+        "/yymmdd SYMBOL 做診斷（例：/240101 AAPL）"
+    )
+
+
+async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    try:
+        await execute_scan(context.bot, chat_id, None, "Manual")
+    except Exception as e:
+        logger.exception("Manual /now failed")
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ 掃描失敗: {e}")
 
-async def run_diagnostic_background(chat_id, status_message_id, date_str, symbol, context):
+
+async def history_scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    # message like "/240101"
+    date_str = update.message.text.strip().lstrip("/").strip()
+    try:
+        await execute_scan(context.bot, chat_id, date_str, f"History({date_str})")
+    except Exception as e:
+        logger.exception("History scan failed")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ 歷史掃描失敗: {e}")
+
+
+async def diagnostic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    # message like "/240101 AAPL"
+    raw = update.message.text.strip().lstrip("/")
+    parts = raw.split()
+    if len(parts) < 2:
+        await context.bot.send_message(chat_id=chat_id, text="用法：/yymmdd SYMBOL（例：/240101 AAPL）")
+        return
+
+    date_str, symbol = parts[0], parts[1].upper()
+
+    # quick ack
+    msg = await context.bot.send_message(chat_id=chat_id, text=f"🔎 診斷中：{symbol} @ {date_str} ...")
     try:
         is_pass, report, formatted_date = await fetch_and_diagnose(symbol, date_str)
-        if len(report) > 4000:
-            report = report[:4000] + "\n...(截斷)"
+        status = "✅ PASS" if is_pass else "❌ FAIL"
         await context.bot.edit_message_text(
             chat_id=chat_id,
-            message_id=status_message_id,
-            text=report,
-            parse_mode=ParseMode.MARKDOWN
+            message_id=msg.message_id,
+            text=f"{status} {symbol} @ {formatted_date}\n\n{report}",
         )
     except Exception as e:
         logger.exception("Diagnostic failed")
         await context.bot.edit_message_text(
             chat_id=chat_id,
-            message_id=status_message_id,
-            text=f"❌ 錯誤: {e}"
+            message_id=msg.message_id,
+            text=f"⚠️ 診斷失敗: {e}",
         )
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🗽 **美股 VCP / Fallen Angel 狙擊手**\n\n"
-        "1. `/now`: 立即掃描 (NASDAQ)\n"
-        "2. `/231225`: 回測特定日期\n"
-        "3. `/231225 NVDA`: 診斷特定個股\n\n"
-        "📌 掃描完成會同時傳送：\n"
-        "- TradingView TXT（每檔一個區塊）\n"
-        "- CSV 指標明細",
-        parse_mode=ParseMode.MARKDOWN
-    )
 
-async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 啟動美股掃描...")
-    asyncio.create_task(run_full_scan_background(update.effective_chat.id, context, None, "Today"))
+async def post_init(app):
+    # schedule daily scans after application is initialized
+    schedule_daily_scan(app)
 
-async def history_scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    date_str = update.message.text.replace('/', '').strip()
-    await update.message.reply_text(f"⏳ 準備回測: {date_str}...")
-    asyncio.create_task(run_full_scan_background(update.effective_chat.id, context, date_str, date_str))
-
-async def diagnostic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.replace('/', '').strip()
-    parts = text.split()
-    if len(parts) < 2:
-        return
-    date_str, symbol = parts[0], parts[1]
-    msg = await update.message.reply_text(f"👨‍⚕️ 診斷中: {symbol}...")
-    asyncio.create_task(run_diagnostic_background(update.effective_chat.id, msg.message_id, date_str, symbol, context))
-
-async def scheduled_scan_job(context: ContextTypes.DEFAULT_TYPE):
-    if not TG_CHAT_ID:
-        return
-    await context.bot.send_message(chat_id=TG_CHAT_ID, text="🔔 美股收盤後自動掃描啟動...")
-    await run_full_scan_background(TG_CHAT_ID, context, None, "Scheduled")
 
 def main():
     if not TG_TOKEN:
-        raise RuntimeError("TG_TOKEN not found")
+        raise RuntimeError("TG_TOKEN not found (Zeabur Env)")
 
-    app = ApplicationBuilder().token(TG_TOKEN).build()
+    app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("now", now_command))
-    app.add_handler(MessageHandler(filters.Regex(r'^\/\d{6}\s+.+$'), diagnostic_handler))
-    app.add_handler(MessageHandler(filters.Regex(r'^\/\d{6}$'), history_scan_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^\/\d{6}\s+.+$"), diagnostic_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^\/\d{6}$"), history_scan_handler))
 
-    tz_ny = pytz.timezone('America/New_York')
-    app.job_queue.run_daily(
-        scheduled_scan_job,
-        time=dtime(hour=16, minute=15),
-        days=(0, 1, 2, 3, 4),
-        tzinfo=tz_ny
-    )
-
-    print("🤖 US Stock Bot started...")
+    logger.info("🤖 US Stock Bot started...")
     app.run_polling()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
