@@ -1,8 +1,8 @@
-python-telegram-bot
-python-dotenv
-pytz
-pandas
-pandas_ta
-yfinance
-requests
-
+python-telegram-bot[job-queue]==20.7
+APScheduler==3.10.4
+python-dotenv==1.0.1
+pytz==2025.2
+pandas==2.2.3
+pandas_ta==0.4.71b0
+yfinance==0.2.40
+requests==2.32.3
