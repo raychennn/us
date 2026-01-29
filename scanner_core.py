@@ -13,51 +13,95 @@ from datetime import datetime, timedelta
 # 策略參數
 import config as cfg
 
-# --- A. 自動獲取 NASDAQ 清單 (嚴格過濾版) ---
-def get_nasdaq_stock_list():
+# --- A. 自動獲取美股全市場清單 (NASDAQ + NYSE) ---
+def get_all_us_stocks():
     """
-    從 NASDAQ 獲取清單，並嚴格過濾 ETF, ADR, 權證, 特別股
-    (已加入 Timeout 與 User-Agent 防止在 Zeabur 上卡死)
+    從 NASDAQ Trader 獲取 NASDAQ 與 NYSE 清單
+    並執行嚴格過濾 (排除 ETF, ADR, 權證, 特別股)
     """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    # 定義通用的排除關鍵字
+    exclude_keywords = [
+        ' ADR ', ' ADS ', ' DEPOSITARY ', # ADR 相關
+        ' PREFERRED ', ' PFD ',           # 特別股
+        ' WARRANT ', ' WTS ', ' UNIT ',   # 權證與單位
+        ' RIGHTS ',                       # 認股權
+        ' ACQUISITION '                   # SPAC 相關
+    ]
+
+    candidates = set()
+
+    # --- 1. 獲取 NASDAQ 清單 ---
     try:
-        url = "http://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
+        url_nasdaq = "http://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+        res = requests.get(url_nasdaq, headers=headers, timeout=15)
+        res.raise_for_status()
         
-        s = response.content
-        df = pd.read_csv(io.BytesIO(s), sep="|")
+        df = pd.read_csv(io.BytesIO(res.content), sep="|")
         
+        # 基礎過濾
         df = df.dropna(subset=['Symbol'])
         df = df[df['Test Issue'] == 'N']
-        
         if 'ETF' in df.columns:
             df = df[df['ETF'] == 'N']
             
+        # 名稱過濾
         df['Security Name'] = df['Security Name'].str.upper()
-        
-        exclude_keywords = [
-            ' ADR ', ' ADS ', ' DEPOSITARY ',
-            ' PREFERRED ', ' PFD ',
-            ' WARRANT ', ' WTS ', ' UNIT ',
-            ' RIGHTS ',
-            ' ACQUISITION '
-        ]
-        
         for kw in exclude_keywords:
             df = df[~df['Security Name'].str.contains(kw, na=False)]
-
-        full_list = df['Symbol'].tolist()
-        clean_list = [x for x in full_list if x.isalpha()]
-        
-        print(f"✅ 成功獲取 {len(clean_list)} 檔 NASDAQ 本土股票 (已排除 ETF/ADR/權證)")
-        return clean_list 
+            
+        # 符號過濾 (只留純字母，去除有後綴的)
+        nasdaq_list = [x for x in df['Symbol'].tolist() if str(x).isalpha()]
+        candidates.update(nasdaq_list)
+        print(f"✅ NASDAQ 篩選後數量: {len(nasdaq_list)}")
         
     except Exception as e:
-        print(f"❌ 獲取 NASDAQ 清單失敗 (使用備用清單): {e}")
+        print(f"⚠️ NASDAQ 清單獲取失敗: {e}")
+
+    # --- 2. 獲取 NYSE 清單 (從 otherlisted.txt) ---
+    try:
+        url_nyse = "http://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+        res = requests.get(url_nyse, headers=headers, timeout=15)
+        res.raise_for_status()
+        
+        df = pd.read_csv(io.BytesIO(res.content), sep="|")
+        
+        # 基礎過濾
+        # 注意: otherlisted 的代碼欄位叫做 'ACT Symbol'
+        df = df.dropna(subset=['ACT Symbol'])
+        df = df[df['Test Issue'] == 'N']
+        if 'ETF' in df.columns:
+            df = df[df['ETF'] == 'N']
+            
+        # [關鍵] 鎖定 NYSE (Exchange Code = 'N')
+        # A = NYSE American, N = NYSE, P = NYSE Arca, Z = BATS
+        df = df[df['Exchange'] == 'N']
+        
+        # 名稱過濾
+        df['Security Name'] = df['Security Name'].str.upper()
+        for kw in exclude_keywords:
+            df = df[~df['Security Name'].str.contains(kw, na=False)]
+            
+        # 符號過濾
+        nyse_list = [x for x in df['ACT Symbol'].tolist() if str(x).isalpha()]
+        candidates.update(nyse_list)
+        print(f"✅ NYSE 篩選後數量: {len(nyse_list)}")
+        
+    except Exception as e:
+        print(f"⚠️ NYSE 清單獲取失敗: {e}")
+
+    final_list = sorted(list(candidates))
+    
+    # 如果兩邊都掛了，回傳備用清單
+    if not final_list:
+        print("❌ 無法獲取任何清單，使用備用大型股")
         return ['AAPL', 'MSFT', 'AMZN', 'NVDA', 'TSLA', 'META', 'AMD', 'NFLX', 'GOOGL', 'AVGO']
+        
+    print(f"🚀 全市場 (NASDAQ + NYSE) 總掃描檔數: {len(final_list)}")
+    return final_list
 
 # --- B. 輔助計算: RS Score ---
 def calculate_performance_score(close_series):
@@ -228,7 +272,7 @@ def check_vcp_criteria(df, qqq_close=None):
     avg_vol_3 = vol.tail(3).mean()
     if avg_vol_3 >= (avg_vol_20 * cfg.VDU_MAX_RATIO): return False
 
-    # 5. VCP Tightness (Dynamic Gap) - 修改：確保使用收盤價計算震幅
+    # 5. VCP Tightness (Dynamic Gap) - 確保使用收盤價計算震幅
     check_days = cfg.VCP_TIGHT_DAYS
     recent_closes = close.tail(check_days).tolist()
     recent_opens = open_price.tail(check_days).tolist()
@@ -250,11 +294,11 @@ def check_vcp_criteria(df, qqq_close=None):
             # 有跳空時，動態放寬容許震幅
             allowed_tightness = math.ceil(max_magnitude * 100) / 100.0
             
-    # [UPDATED] 取出有效區間的「收盤價」序列
+    # 取出有效區間的「收盤價」序列
     adjusted_closes = recent_closes[valid_start_index:]
     
     if len(adjusted_closes) >= 2:
-        # [UPDATED] 震幅計算：(最高收盤價 - 最低收盤價) / 現價
+        # 震幅計算：(最高收盤價 - 最低收盤價) / 現價
         max_c = max(adjusted_closes)
         min_c = min(adjusted_closes)
         range_pct = (max_c - min_c) / current_c
@@ -358,7 +402,6 @@ def diagnose_single_stock(df, symbol, qqq_df=None):
             
     adjusted_closes = recent_closes[valid_start_index:]
     
-    # [UPDATED] 修改報告文字，明確指出計算邏輯
     report.append(f"\n🔹 **收斂 ({check_days}d)**")
     if valid_start_index>0: report.append(f"   ℹ️ 跳空 {gap_msg}")
     
@@ -405,7 +448,7 @@ def diagnose_single_stock(df, symbol, qqq_df=None):
 # --- E. 掃描執行 ---
 async def scan_market(target_date_str):
     try:
-        # [UPDATED] 如果沒有傳入 target_date_str，預設使用現在時間
+        # 如果沒有傳入 target_date_str，預設使用現在時間
         if target_date_str:
             target_date = datetime.strptime(target_date_str, "%y%m%d")
         else:
@@ -425,7 +468,9 @@ async def scan_market(target_date_str):
         qqq_close = qqq_data['Close'] if not isinstance(qqq_data.columns, pd.MultiIndex) else qqq_data['Close'][cfg.BENCH_SYMBOL]
         qqq_close = qqq_close.dropna()
 
-        tickers = get_nasdaq_stock_list()
+        # [UPDATED] 使用新的函式獲取 全市場 (NASDAQ + NYSE) 清單
+        tickers = get_all_us_stocks()
+        
         batch_size = cfg.YF_BATCH_SIZE 
         rows = []
 
@@ -443,7 +488,7 @@ async def scan_market(target_date_str):
                         df.dropna(inplace=True)
                         if df.empty: continue
                         
-                        # 日期檢查 (確保是取到 target_date 當天或前一天的資料，防止取到空值)
+                        # 日期檢查
                         last_dt = df.index[-1].date()
                         if abs((last_dt - target_date.date()).days) > 1: continue
                         
