@@ -1,8 +1,8 @@
-python-telegram-bot==20.7
-python-dotenv==1.0.1
-pytz==2025.2
-pandas==2.2.3
-pandas_ta==0.3.14b0
-yfinance==0.2.40
-requests==2.32.3
+python-telegram-bot
+python-dotenv
+pytz
+pandas
+pandas_ta
+yfinance
+requests
 
