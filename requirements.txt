@@ -1,4 +1,4 @@
-# 1. 建置輔助 (優先安裝，幫助 pip 正確識別環境)
+# 1. 基礎工具
 wheel
 setuptools
 
@@ -8,13 +8,9 @@ APScheduler
 python-dotenv
 pytz
 
-# 3. 關鍵限制 (絕對不能拿掉！)
-# 只要鎖住 numpy 不要升上 2.0，其他套件讓 pip 自動去配對最穩定的版本
-numpy<2.0.0
-
-# 4. 資料科學套件 (不鎖版本)
-# pip 會自動尋找支援上述 numpy 版本且有 "Binary Wheel" (免編譯) 的最新 pandas
+# 3. 數據核心
+# 移除所有版本鎖定，讓 pip 自動抓取與環境最相容的 "預編譯檔案 (Wheel)"
 pandas
-pandas_ta
+numpy
 yfinance
 requests
