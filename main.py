@@ -2,6 +2,7 @@ import os
 import io
 import asyncio
 import logging
+import sys
 from datetime import datetime, timedelta, time as dtime
 
 import pytz
@@ -20,16 +21,26 @@ from telegram.ext import (
 import config as cfg
 from scanner_core import scan_market, fetch_and_diagnose
 
+# 載入 .env
 load_dotenv()
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
+# Setup logging to stdout (重要：確保 Zeabur logs 能看到)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
+# 環境變數檢查
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+
+if not TG_TOKEN:
+    logger.error("❌ 致命錯誤: 未設定 TG_TOKEN 環境變數")
+    sys.exit(1)
+if not TG_CHAT_ID:
+    logger.warning("⚠️ 警告: 未設定 TG_CHAT_ID，部分功能可能無法運作")
 
 # -----------------------
 # Output helpers
@@ -74,10 +85,11 @@ async def execute_scan(bot, chat_id: str, date_str: str | None, tag: str):
     date_str: None 或 "yymmdd"
     """
     if not chat_id:
-        raise RuntimeError("TG_CHAT_ID not set (Zeabur Env)")
+        logger.error("TG_CHAT_ID not set")
+        return
 
     # 這裡 date_str 用於 scan_market 的「回測日期」功能（yymmdd）
-    rows, formatted_date = scan_market(date_str)
+    rows, formatted_date = await scan_market(date_str)
 
     # 預覽前 20
     preview_lines = []
@@ -270,18 +282,19 @@ async def post_init(app):
 
 
 def main():
-    if not TG_TOKEN:
-        raise RuntimeError("TG_TOKEN not found (Zeabur Env)")
+    try:
+        app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
 
-    app = ApplicationBuilder().token(TG_TOKEN).post_init(post_init).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("now", now_command))
+        app.add_handler(MessageHandler(filters.Regex(r"^\/\d{6}\s+.+$"), diagnostic_handler))
+        app.add_handler(MessageHandler(filters.Regex(r"^\/\d{6}$"), history_scan_handler))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("now", now_command))
-    app.add_handler(MessageHandler(filters.Regex(r"^\/\d{6}\s+.+$"), diagnostic_handler))
-    app.add_handler(MessageHandler(filters.Regex(r"^\/\d{6}$"), history_scan_handler))
-
-    logger.info("🤖 US Stock Bot started...")
-    app.run_polling()
+        logger.info("🤖 US Stock Bot started...")
+        app.run_polling()
+    except Exception as e:
+        logger.critical(f"Main Loop Crash: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
