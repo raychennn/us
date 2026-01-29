@@ -228,7 +228,7 @@ def check_vcp_criteria(df, qqq_close=None):
     avg_vol_3 = vol.tail(3).mean()
     if avg_vol_3 >= (avg_vol_20 * cfg.VDU_MAX_RATIO): return False
 
-    # 5. VCP Tightness (Dynamic Gap)
+    # 5. VCP Tightness (Dynamic Gap) - 修改：確保使用收盤價計算震幅
     check_days = cfg.VCP_TIGHT_DAYS
     recent_closes = close.tail(check_days).tolist()
     recent_opens = open_price.tail(check_days).tolist()
@@ -247,14 +247,18 @@ def check_vcp_criteria(df, qqq_close=None):
             valid_start_index = i
             day_gain_magnitude = (curr_c - prev_c) / prev_c
             max_magnitude = max(gap_magnitude, day_gain_magnitude)
+            # 有跳空時，動態放寬容許震幅
             allowed_tightness = math.ceil(max_magnitude * 100) / 100.0
             
+    # [UPDATED] 取出有效區間的「收盤價」序列
     adjusted_closes = recent_closes[valid_start_index:]
     
     if len(adjusted_closes) >= 2:
+        # [UPDATED] 震幅計算：(最高收盤價 - 最低收盤價) / 現價
         max_c = max(adjusted_closes)
         min_c = min(adjusted_closes)
         range_pct = (max_c - min_c) / current_c
+        
         if range_pct > allowed_tightness: return False 
 
     # 6. RS Fallen Angel Gate
@@ -263,10 +267,7 @@ def check_vcp_criteria(df, qqq_close=None):
         if not rs_pass:
             return False
 
-    # 7. 趨勢濾網 (Trend) [FIX: 改用原生 Pandas 計算 MA]
-    # sma50 = ta.sma(close, length=50)   <-- 舊的寫法 (依賴 pandas_ta)
-    # sma200 = ta.sma(close, length=200) <-- 舊的寫法
-    
+    # 7. 趨勢濾網 (Trend)
     sma50 = close.rolling(window=50).mean()
     sma200 = close.rolling(window=200).mean()
     
@@ -356,18 +357,21 @@ def diagnose_single_stock(df, symbol, qqq_df=None):
             gap_msg = f"(Gap:{gap_mag*100:.1f}%)"
             
     adjusted_closes = recent_closes[valid_start_index:]
-    max_c = max(adjusted_closes)
-    min_c = min(adjusted_closes)
-    range_pct = (max_c - min_c) / c_now
     
+    # [UPDATED] 修改報告文字，明確指出計算邏輯
     report.append(f"\n🔹 **收斂 ({check_days}d)**")
     if valid_start_index>0: report.append(f"   ℹ️ 跳空 {gap_msg}")
     
-    if range_pct <= allowed_tightness:
-        report.append(f"   ✅ 震幅: {range_pct*100:.2f}% (Limit: {allowed_tightness*100:.1f}%)")
-    else:
-        report.append(f"   ❌ 震幅過大: {range_pct*100:.2f}%")
-        is_pass = False
+    if len(adjusted_closes) >= 2:
+        max_c = max(adjusted_closes)
+        min_c = min(adjusted_closes)
+        range_pct = (max_c - min_c) / c_now
+        
+        if range_pct <= allowed_tightness:
+            report.append(f"   ✅ 10日震幅(收盤): {range_pct*100:.2f}% (Limit: {allowed_tightness*100:.1f}%)")
+        else:
+            report.append(f"   ❌ 10日震幅(收盤): {range_pct*100:.2f}%")
+            is_pass = False
 
     # 6. RS
     if qqq_df is not None:
@@ -386,9 +390,7 @@ def diagnose_single_stock(df, symbol, qqq_df=None):
             report.append("   ❌ FAIL")
             is_pass = False
 
-    # 7. Trend [FIX: 原生 Pandas]
-    # sma50 = ta.sma(close, length=50).iloc[-1]
-    # sma200 = ta.sma(close, length=200).iloc[-1]
+    # 7. Trend
     sma50 = close.rolling(window=50).mean().iloc[-1]
     sma200 = close.rolling(window=200).mean().iloc[-1]
     
@@ -403,11 +405,13 @@ def diagnose_single_stock(df, symbol, qqq_df=None):
 # --- E. 掃描執行 ---
 async def scan_market(target_date_str):
     try:
+        # [UPDATED] 如果沒有傳入 target_date_str，預設使用現在時間
         if target_date_str:
             target_date = datetime.strptime(target_date_str, "%y%m%d")
         else:
             target_date = datetime.now()
         
+        # 回測設定
         start_date = target_date - timedelta(days=cfg.HIST_CALENDAR_DAYS)
         end_date = target_date + timedelta(days=1)
         formatted_date = target_date.strftime('%Y-%m-%d')
@@ -439,6 +443,7 @@ async def scan_market(target_date_str):
                         df.dropna(inplace=True)
                         if df.empty: continue
                         
+                        # 日期檢查 (確保是取到 target_date 當天或前一天的資料，防止取到空值)
                         last_dt = df.index[-1].date()
                         if abs((last_dt - target_date.date()).days) > 1: continue
                         
