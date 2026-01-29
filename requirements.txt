@@ -1,15 +1,19 @@
+# 基礎套件
 python-telegram-bot[job-queue]==20.7
 APScheduler==3.10.4
 python-dotenv==1.0.1
 pytz
 
-# --- 關鍵修正 ---
-# 1. 鎖定 Numpy < 2.0 (因為 pandas-ta 尚未支援 Numpy 2.x，這非常重要)
-numpy<2.0.0
+# --- 黃金組合 (Golden Combination) ---
+# 強制指定已知有 Binary Wheel 的穩定版本，防止 pip 嘗試從原始碼編譯
+# 1. 鎖定 Numpy 為 1.x 的最後一個穩定版 (避開 2.0 災情)
+numpy==1.26.4
 
-# 2. 放寬資料科學套件的版本限制
-# 讓 pip 自動尋找能與 numpy<2.0 以及 pandas-ta 相容的最新版本
-pandas
+# 2. 鎖定 Pandas 為 2.1.x (比 2.2.x 更穩定支援 Numpy 1.26，且通常都有 Wheel)
+pandas==2.1.4
+
+# 3. 技術分析與財經數據
+# 這些套件會自動依賴上面的 numpy/pandas 版本
 pandas_ta
 yfinance
 requests
