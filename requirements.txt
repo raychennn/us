@@ -3,6 +3,8 @@ APScheduler==3.10.4
 python-dotenv==1.0.1
 pytz==2025.2
 pandas==2.2.3
+# 鎖定 numpy 版本，避免 pandas_ta 崩潰
+numpy<2.0.0
 pandas_ta==0.4.71b0
 yfinance==0.2.40
 requests==2.32.3
