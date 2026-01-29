@@ -24,7 +24,7 @@ from scanner_core import scan_market, fetch_and_diagnose
 # 載入 .env
 load_dotenv()
 
-# Setup logging to stdout (重要：確保 Zeabur logs 能看到)
+# Setup logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -46,10 +46,6 @@ if not TG_CHAT_ID:
 # Output helpers
 # -----------------------
 def make_tradingview_text(rows):
-    """
-    TradingView 匯入清單：每個 symbol 之間用區塊間隔（預設空一行）。
-    可透過 config.py 調整 TRADINGVIEW_PREFIX / TRADINGVIEW_BLOCK_SEPARATOR。
-    """
     symbols = []
     for r in rows:
         s = str(r.get("Symbol", "")).strip()
@@ -77,18 +73,49 @@ def make_csv_bytes(rows, date_label):
 
 
 # -----------------------
+# Helper: Determine "Latest Closed" Date
+# -----------------------
+def get_latest_market_date():
+    """
+    獲取「最近一個已收盤」的交易日。
+    邏輯：
+    1. 如果現在時間 < 16:00 (美東)，代表今日尚未收盤，取昨日。
+    2. 如果現在時間 >= 16:00 (美東)，代表今日已收盤，取今日。
+    3. 如果遇到週末 (六/日)，自動回推至週五。
+    """
+    tz_ny = pytz.timezone(cfg.SCHEDULE_TZ)
+    now_ny = datetime.now(tz_ny)
+    
+    # 判斷是否過收盤時間 (16:00)
+    market_close_time = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+    
+    if now_ny < market_close_time:
+        # 尚未收盤，基準日為昨天
+        target_date = now_ny - timedelta(days=1)
+    else:
+        # 已收盤，基準日為今天
+        target_date = now_ny
+
+    # 週末回推處理
+    # weekday(): 0=Mon, ..., 4=Fri, 5=Sat, 6=Sun
+    while target_date.weekday() > 4: 
+        target_date -= timedelta(days=1)
+        
+    return target_date
+
+
+# -----------------------
 # Core actions
 # -----------------------
 async def execute_scan(bot, chat_id: str, date_str: str | None, tag: str):
     """
     跑掃描並把摘要 + TradingView txt + CSV 明細傳回 Telegram。
-    date_str: None 或 "yymmdd"
     """
     if not chat_id:
         logger.error("TG_CHAT_ID not set")
         return
 
-    # 這裡 date_str 用於 scan_market 的「回測日期」功能（yymmdd）
+    # 執行掃描 (scanner_core)
     rows, formatted_date = await scan_market(date_str)
 
     # 預覽前 20
@@ -113,11 +140,11 @@ async def execute_scan(bot, chat_id: str, date_str: str | None, tag: str):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # TradingView TXT（區塊間隔）
+    # TradingView TXT
     tv_text = make_tradingview_text(rows)
     txt_bio = make_txt_bytes(tv_text, formatted_date)
 
-    # CSV（含欄位）
+    # CSV
     csv_bio, _df = make_csv_bytes(rows, formatted_date)
 
     await bot.send_document(
@@ -146,36 +173,25 @@ async def scheduled_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # -----------------------
-# Manual scheduler fallback (when JobQueue is unavailable)
+# Manual scheduler fallback
 # -----------------------
 def _next_run_ny(now_ny: datetime) -> datetime:
-    """Return the next run datetime in NY tz using cfg schedule settings."""
     run_dt = now_ny.replace(
         hour=cfg.SCHEDULE_HOUR,
         minute=cfg.SCHEDULE_MINUTE,
         second=0,
         microsecond=0,
     )
-
-    # if time passed today, move to tomorrow
     if run_dt <= now_ny:
         run_dt = run_dt + timedelta(days=1)
-
-    # ensure weekday matches
     while run_dt.weekday() not in cfg.SCHEDULE_WEEKDAYS:
         run_dt = run_dt + timedelta(days=1)
-
     return run_dt
 
 
 async def manual_scheduler_loop(app):
-    """
-    如果 python-telegram-bot 沒有安裝 job-queue 依賴（導致 app.job_queue=None），
-    這裡用 asyncio 自己做每天固定時間觸發。
-    """
     tz_ny = pytz.timezone(cfg.SCHEDULE_TZ)
     logger.warning("JobQueue unavailable; using manual scheduler loop.")
-
     while True:
         try:
             now_ny = datetime.now(tz_ny)
@@ -183,8 +199,6 @@ async def manual_scheduler_loop(app):
             sleep_sec = max(1, int((nxt - now_ny).total_seconds()))
             logger.info("Next scheduled scan at %s (sleep %ss)", nxt.isoformat(), sleep_sec)
             await asyncio.sleep(sleep_sec)
-
-            # run
             if TG_CHAT_ID:
                 await execute_scan(app.bot, TG_CHAT_ID, None, "Scheduled(manual)")
         except asyncio.CancelledError:
@@ -196,7 +210,6 @@ async def manual_scheduler_loop(app):
 
 def schedule_daily_scan(app):
     tz_ny = pytz.timezone(cfg.SCHEDULE_TZ)
-
     if getattr(app, "job_queue", None) is not None:
         try:
             app.job_queue.run_daily(
@@ -208,9 +221,7 @@ def schedule_daily_scan(app):
             logger.info("Scheduled scan registered via JobQueue (%s)", cfg.SCHEDULE_TZ)
             return
         except Exception:
-            logger.exception("Failed to register JobQueue schedule. Falling back to manual scheduler.")
-
-    # fallback
+            logger.exception("Failed to register JobQueue. Falling back to manual.")
     app.create_task(manual_scheduler_loop(app))
 
 
@@ -220,16 +231,30 @@ def schedule_daily_scan(app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 US Stock Bot\n"
-        "/now 立即掃描\n"
+        "/now 立即掃描 (只取已收盤資料)\n"
         "/yymmdd 回測日期掃描（例：/240101）\n"
         "/yymmdd SYMBOL 做診斷（例：/240101 AAPL）"
     )
 
 
 async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /now 指令處理器
+    自動計算最近的「已收盤」交易日並執行掃描。
+    """
     chat_id = str(update.effective_chat.id)
+    
+    # 1. 取得最近的收盤日 (datetime 物件)
+    target_date = get_latest_market_date()
+    # 2. 轉為 yymmdd 字串格式，模擬使用者手動輸入日期
+    date_str = target_date.strftime("%y%m%d")
+    
+    formatted_date_display = target_date.strftime("%Y-%m-%d")
+    await context.bot.send_message(chat_id=chat_id, text=f"🚀 收到 /now 指令\n鎖定最近收盤日: {formatted_date_display}\n開始掃描...")
+
     try:
-        await execute_scan(context.bot, chat_id, None, "Manual")
+        # 3. 傳入計算好的日期字串，確保 scan_market 抓取的是該日期的靜態資料
+        await execute_scan(context.bot, chat_id, date_str, f"Manual({date_str})")
     except Exception as e:
         logger.exception("Manual /now failed")
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ 掃描失敗: {e}")
@@ -237,7 +262,6 @@ async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def history_scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    # message like "/240101"
     date_str = update.message.text.strip().lstrip("/").strip()
     try:
         await execute_scan(context.bot, chat_id, date_str, f"History({date_str})")
@@ -248,7 +272,6 @@ async def history_scan_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def diagnostic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    # message like "/240101 AAPL"
     raw = update.message.text.strip().lstrip("/")
     parts = raw.split()
     if len(parts) < 2:
@@ -256,8 +279,6 @@ async def diagnostic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     date_str, symbol = parts[0], parts[1].upper()
-
-    # quick ack
     msg = await context.bot.send_message(chat_id=chat_id, text=f"🔎 診斷中：{symbol} @ {date_str} ...")
     try:
         is_pass, report, formatted_date = await fetch_and_diagnose(symbol, date_str)
@@ -277,7 +298,6 @@ async def diagnostic_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def post_init(app):
-    # schedule daily scans after application is initialized
     schedule_daily_scan(app)
 
 
