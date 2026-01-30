@@ -8,6 +8,10 @@ from utils import get_current_est_time, is_market_open
 from strategy import run_scanner
 import logging
 
+# --- 關鍵修正：強制將 httpx 的日誌等級調高到 WARNING ---
+# 這會隱藏所有 HTTP 200 OK 的連線紀錄，只顯示錯誤
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
