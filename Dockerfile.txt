@@ -4,8 +4,12 @@ FROM python:3.9-slim
 # 設定工作目錄
 WORKDIR /app
 
-# 安裝系統依賴 (如果 TA-Lib binary 無法運作，需要打開下方的註解編譯)
-# RUN apt-get update && apt-get install -y build-essential curl && rm -rf /var/lib/apt/lists/*
+# --- 關鍵修正 ---
+# 安裝系統依賴 (GCC, Make 等編譯工具)
+# 這是為了解決 pandas 或 numpy 需要從源碼編譯時發生的 "ninja" 或 "metadata" 錯誤
+RUN apt-get update && \
+    apt-get install -y build-essential python3-dev curl && \
+    rm -rf /var/lib/apt/lists/*
 
 # 複製 requirements.txt 並安裝
 COPY requirements.txt .
