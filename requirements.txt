@@ -1,16 +1,8 @@
-# 1. 基礎工具
-wheel
-setuptools
-
-# 2. 機器人核心
-python-telegram-bot[job-queue]
-APScheduler
-python-dotenv
-pytz
-
-# 3. 數據核心
-# 移除所有版本鎖定，讓 pip 自動抓取與環境最相容的 "預編譯檔案 (Wheel)"
-pandas
-numpy
-yfinance
-requests
+python-telegram-bot==20.8
+yfinance==0.2.36
+pandas==2.2.0
+numpy==1.26.3
+apscheduler==3.10.4
+pytz==2024.1
+requests==2.31.0
+ta-lib-binary==0.4.26 ; sys_platform == 'linux'
