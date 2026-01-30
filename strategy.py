@@ -4,6 +4,7 @@ import yfinance as yf
 import time
 import logging
 from config import *
+from utils import get_market_tickers  # 修正：匯入這個函式
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,10 @@ def fetch_data(tickers):
     # 處理 Benchmark 收盤價 (用於 RS Line)
     # yfinance 有時回傳 MultiIndex，需要正規化
     if isinstance(spy.columns, pd.MultiIndex):
-        spy_close = spy['Close'][BENCHMARK_TICKER]
+        try:
+            spy_close = spy['Close'][BENCHMARK_TICKER]
+        except KeyError:
+            spy_close = spy['Close'] # 嘗試直接取 Close
     else:
         spy_close = spy['Close']
 
@@ -37,7 +41,7 @@ def fetch_data(tickers):
         logger.info(f"下載批次 {i}/{total}: {batch[:3]}...")
         
         try:
-            # 下載 1 年數據以計算 200MA 和 RS Line (6M)
+            # 下載 2 年數據以計算 200MA 和 RS Line (6M)
             df = yf.download(batch, period="2y", group_by='ticker', threads=True, progress=False)
             
             # 處理 yfinance 下載單一股票與多股票結構不同的問題
@@ -88,7 +92,7 @@ def calculate_indicators(df, spy_close):
         
         # 0. 基礎運算
         sma50 = close.rolling(window=50).mean()
-        sma200 = close.rolling(window=200).mean()
+        # sma200 = close.rolling(window=200).mean() # 目前沒用到，先註解省效能
         avg_vol_50 = volume.rolling(window=50).mean()
         avg_vol_10 = volume.rolling(window=10).mean()
         avg_vol_5 = volume.rolling(window=5).mean()
@@ -175,18 +179,26 @@ def check_strategy(ticker, data):
     
     # 分支 ①：經典 VCP
     # VCP-1: 整理深度 (這裡簡化為近期 50 日內的 Drawdown)
+    # 取最近 50 天的 High/Low 區間
     recent_50_high = data['history']['High'].iloc[-50:].max()
     recent_50_low = data['history']['Low'].iloc[-50:].min()
-    current_dd = (recent_50_high - data['history']['Low'].iloc[-1]) / recent_50_high
     
-    vcp_dd_ok = current_dd < VCP_MAX_DRAWDOWN
+    # 避免除以零
+    if recent_50_high > 0:
+        current_dd = (recent_50_high - data['history']['Low'].iloc[-1]) / recent_50_high
+        vcp_dd_ok = current_dd < VCP_MAX_DRAWDOWN
+    else:
+        vcp_dd_ok = False
     
     # VCP-3: Volume Dry-Up
     vol_dry_10 = data['avg_vol_10'] <= 0.8 * data['avg_vol_50']
     vol_dry_5 = data['avg_vol_5'] <= 0.7 * data['avg_vol_50']
     
     # VCP-4: 緊密收盤
-    tight_close = (data['close_last_5_max'] - data['close_last_5_min']) / data['close_last_5_min'] <= VCP_TIGHT_CLOSE_PCT
+    if data['close_last_5_min'] > 0:
+        tight_close = (data['close_last_5_max'] - data['close_last_5_min']) / data['close_last_5_min'] <= VCP_TIGHT_CLOSE_PCT
+    else:
+        tight_close = False
     
     if vcp_dd_ok and vol_dry_10 and (vol_dry_5 or tight_close):
         # 註：嚴格的 VCP "幾次收斂" 難以用簡單數學完全過濾，這裡用量縮+盤整+緊密收盤做代理變數
@@ -195,8 +207,7 @@ def check_strategy(ticker, data):
 
     # 分支 ②：Power Play
     # PP-1: 旗桿猛 (4-8週前漲幅)
-    # 取 40 天前與 20 天前的較低者作為起漲點比較，或是直接比 8 週前
-    # 這裡簡化邏輯：檢查過去 20~40 天內最低點到近期高點的漲幅
+    # 取 40 天前與 20 天前的較低者作為起漲點比較
     low_window = data['history']['Low'].iloc[-45:-15].min()
     high_recent = data['base_high_recent']
     
@@ -208,7 +219,11 @@ def check_strategy(ticker, data):
             
     # PP-2: 旗面盤整 (High Tight)
     # 距離近期高點回撤小
-    pp_dd_ok = (high_recent - data['history']['Low'].iloc[-1]) / high_recent <= PP_DRAWDOWN_MAX
+    if high_recent > 0:
+        pp_dd_ok = (high_recent - data['history']['Low'].iloc[-1]) / high_recent <= PP_DRAWDOWN_MAX
+    else:
+        pp_dd_ok = False
+
     # 價格保持在高位 (Close >= Low + 0.6*(High-Low))
     range_high = data['base_high_recent']
     range_low = data['base_low_recent']
