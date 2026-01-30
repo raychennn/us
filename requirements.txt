@@ -6,4 +6,3 @@ apscheduler
 pytz
 requests
 lxml
-ta-lib-binary ; sys_platform == 'linux'
