@@ -12,36 +12,42 @@ logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    logger.info(f"收到 /start 指令，來自 User ID: {user_id}")
+    
     if user_id != ALLOWED_USER_ID:
-        await update.message.reply_text("⛔ 未授權的使用者。")
+        await update.message.reply_text(f"⛔ 未授權的使用者 (ID: {user_id})。請確認 config 設定。")
         return
     await update.message.reply_text(f"🚀 美股 RS/VCP 掃描機器人已啟動！\n目前美東時間: {get_current_est_time(MARKET_TIMEZONE)}\n輸入 /now 立即掃描。")
 
 async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    logger.info(f"收到 /now 指令，來自 User ID: {user_id}")
+    
+    # 1. 權限檢查與回饋
     if user_id != ALLOWED_USER_ID:
+        await update.message.reply_text(f"⛔ 抱歉，您沒有權限執行此操作 (您的 ID: {user_id})。")
         return
 
-    # 防呆：如果市場開盤中，數據可能不準 (yfinance 延遲)
-    # if is_market_open(MARKET_TIMEZONE):
-    #     await update.message.reply_text("⚠️ 警告：目前美股尚未收盤，數據可能不完整或有延遲。")
-    
-    status_msg = await update.message.reply_text("🔍 開始掃描全市場... 這可能需要幾分鐘，請稍候。")
+    # 2. 立即發送「收到指令」訊息，避免使用者以為機器人當機
+    status_msg = await update.message.reply_text("🤖 指令已接收，正在啟動掃描程序...\n(掃描全市場約需數分鐘，請勿重複點擊)")
     
     try:
-        # 在另一個 thread 執行掃描以免卡死 Bot
+        # 3. 執行掃描 (在背景執行緒)
         loop = asyncio.get_running_loop()
+        # 更新訊息狀態
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text="🔍 正在下載數據與計算 VCP 型態...\n進度：0% (初始化)")
+        
         results = await loop.run_in_executor(None, run_scanner)
         
         if not results:
             await status_msg.edit_text("❌ 本次掃描無符合條件的股票。")
             return
             
-        # 1. 製作文字報告
+        # 4. 製作文字報告
         msg = f"📊 **掃描結果 ({len(results)})**\n"
         msg += f"Time: {get_current_est_time(MARKET_TIMEZONE)}\n\n"
         
-        # 只顯示前 15 檔以免訊息過長
+        # 只顯示前 15 檔
         for item in results[:15]:
             msg += f"🔹 `{item['Ticker']}`: {item['Price']}$ | {item['Pattern']}\n"
             
@@ -50,26 +56,22 @@ async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         await status_msg.edit_text(msg, parse_mode='Markdown')
         
-        # 2. 製作 TradingView 匯入檔 (TXT)
-        # 格式: NASDAQ:AAPL,NYSE:TSLA,...
-        # 簡單起見，統一加個前綴或只給 Ticker (TV 通常能自動辨識)
+        # 5. 傳送 TradingView 檔案
         tv_list = ",".join([f"{r['Ticker']}" for r in results])
-        
         file_buffer = io.BytesIO(tv_list.encode('utf-8'))
         file_buffer.name = f"watchlist_{get_current_est_time(MARKET_TIMEZONE)[:10]}.txt"
         
         await context.bot.send_document(chat_id=update.effective_chat.id, document=file_buffer, caption="📂 TradingView 匯入清單")
 
     except Exception as e:
-        logger.error(f"掃描執行錯誤: {e}")
-        await status_msg.edit_text(f"❌ 發生錯誤: {str(e)}")
+        logger.error(f"掃描執行錯誤: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ 發生內部錯誤: {str(e)}")
 
-# 用於排程任務的包裝函式
+# 排程任務
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     await context.bot.send_message(chat_id=chat_id, text="⏰ 收盤自動掃描開始...")
     
-    # 這裡直接呼叫邏輯，複製上面 /now 的部分邏輯比較好，或是抽取出來
     try:
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(None, run_scanner)
