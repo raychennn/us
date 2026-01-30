@@ -1,91 +1,50 @@
-import os
-import io
-import asyncio
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, ContextTypes
-from config import TELEGRAM_TOKEN, ALLOWED_USER_ID, MARKET_TIMEZONE
-from utils import get_current_est_time, is_market_open
-from strategy import run_scanner
 import logging
+import pytz
+from telegram.ext import Application, CommandHandler
+from config import TELEGRAM_TOKEN, ALLOWED_USER_ID, MARKET_CLOSE_HOUR, MARKET_TIMEZONE
+from bot import start, now, scheduled_job
+from datetime import time
 
+# 設定日誌格式
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    logger.info(f"收到 /start 指令，來自 User ID: {user_id}")
-    
-    if user_id != ALLOWED_USER_ID:
-        await update.message.reply_text(f"⛔ 未授權的使用者 (ID: {user_id})。請確認 config 設定。")
-        return
-    await update.message.reply_text(f"🚀 美股 RS/VCP 掃描機器人已啟動！\n目前美東時間: {get_current_est_time(MARKET_TIMEZONE)}\n輸入 /now 立即掃描。")
+# --- 關鍵修改：將 httpx 的日誌等級調高到 WARNING ---
+# 這樣可以隱藏正常的 HTTP 請求日誌 (GET/POST 200 OK)，只顯示錯誤
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    logger.info(f"收到 /now 指令，來自 User ID: {user_id}")
-    
-    # 1. 權限檢查與回饋
-    if user_id != ALLOWED_USER_ID:
-        await update.message.reply_text(f"⛔ 抱歉，您沒有權限執行此操作 (您的 ID: {user_id})。")
+def main():
+    if not TELEGRAM_TOKEN:
+        logger.error("未設定 TELEGRAM_TOKEN，程式結束。")
         return
 
-    # 2. 立即發送「收到指令」訊息，避免使用者以為機器人當機
-    status_msg = await update.message.reply_text("🤖 指令已接收，正在啟動掃描程序...\n(掃描全市場約需數分鐘，請勿重複點擊)")
-    
-    try:
-        # 3. 執行掃描 (在背景執行緒)
-        loop = asyncio.get_running_loop()
-        # 更新訊息狀態
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text="🔍 正在下載數據與計算 VCP 型態...\n進度：0% (初始化)")
-        
-        results = await loop.run_in_executor(None, run_scanner)
-        
-        if not results:
-            await status_msg.edit_text("❌ 本次掃描無符合條件的股票。")
-            return
-            
-        # 4. 製作文字報告
-        msg = f"📊 **掃描結果 ({len(results)})**\n"
-        msg += f"Time: {get_current_est_time(MARKET_TIMEZONE)}\n\n"
-        
-        # 只顯示前 15 檔
-        for item in results[:15]:
-            msg += f"🔹 `{item['Ticker']}`: {item['Price']}$ | {item['Pattern']}\n"
-            
-        if len(results) > 15:
-            msg += f"\n...還有 {len(results)-15} 檔，請查看檔案。"
-            
-        await status_msg.edit_text(msg, parse_mode='Markdown')
-        
-        # 5. 傳送 TradingView 檔案
-        tv_list = ",".join([f"{r['Ticker']}" for r in results])
-        file_buffer = io.BytesIO(tv_list.encode('utf-8'))
-        file_buffer.name = f"watchlist_{get_current_est_time(MARKET_TIMEZONE)[:10]}.txt"
-        
-        await context.bot.send_document(chat_id=update.effective_chat.id, document=file_buffer, caption="📂 TradingView 匯入清單")
+    # 建立 Application
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    except Exception as e:
-        logger.error(f"掃描執行錯誤: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ 發生內部錯誤: {str(e)}")
+    # 加入指令處理器
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("now", now))
 
-# 排程任務
-async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    await context.bot.send_message(chat_id=chat_id, text="⏰ 收盤自動掃描開始...")
+    # --- 設定排程任務 ---
+    job_queue = application.job_queue
     
-    try:
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(None, run_scanner)
+    if ALLOWED_USER_ID:
+        # 設定在美東時間收盤後執行 (例如收盤後 15 分鐘：16:15)
+        est_tz = pytz.timezone(MARKET_TIMEZONE)
+        target_time = time(hour=MARKET_CLOSE_HOUR, minute=15, tzinfo=est_tz)
         
-        if results:
-            tv_list = ",".join([f"{r['Ticker']}" for r in results])
-            file_buffer = io.BytesIO(tv_list.encode('utf-8'))
-            file_buffer.name = f"watchlist_daily.txt"
-            
-            await context.bot.send_message(chat_id=chat_id, text=f"📊 自動掃描完成，共 {len(results)} 檔。")
-            await context.bot.send_document(chat_id=chat_id, document=file_buffer)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text="📊 自動掃描完成，無標的。")
-            
-    except Exception as e:
-        logger.error(f"排程錯誤: {e}")
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ 排程執行失敗: {e}")
+        # 每天執行一次
+        job_queue.run_daily(scheduled_job, target_time, chat_id=int(ALLOWED_USER_ID), name='daily_scan')
+        logger.info(f"排程已設定：每天美東時間 {target_time} 執行")
+    else:
+        logger.warning("未設定 ALLOWED_USER_ID，自動排程無法啟動")
+
+    # 啟動 Bot
+    logger.info("Bot 正在啟動... (httpx 日誌已隱藏)")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
